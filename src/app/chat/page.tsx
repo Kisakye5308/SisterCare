@@ -14,8 +14,9 @@ import {
   deleteConversation,
   updateConversationTitle,
   updateConversationPreview,
+  getUserProfile,
 } from "@/lib/firestore";
-import { ChatConversation } from "@/types";
+import { ChatConversation, UserProfile } from "@/types";
 
 interface Message {
   id: string;
@@ -73,9 +74,58 @@ export default function ChatPage() {
   const [error, setError] = useState<string | null>(null);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
+  const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
+  const [isListening, setIsListening] = useState(false);
+  const [speechSupported, setSpeechSupported] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const conversationsRef = useRef<ChatConversation[]>([]);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const recognitionRef = useRef<SpeechRecognition | null>(null);
+
+  // Check for speech recognition support
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      const SpeechRecognition =
+        window.SpeechRecognition || window.webkitSpeechRecognition;
+      if (SpeechRecognition) {
+        setSpeechSupported(true);
+        recognitionRef.current = new SpeechRecognition();
+        recognitionRef.current.continuous = false;
+        recognitionRef.current.interimResults = true;
+        recognitionRef.current.lang = "en-US";
+
+        recognitionRef.current.onresult = (event) => {
+          const transcript = Array.from(event.results)
+            .map((result) => result[0].transcript)
+            .join("");
+          setInputValue(transcript);
+        };
+
+        recognitionRef.current.onend = () => {
+          setIsListening(false);
+        };
+
+        recognitionRef.current.onerror = (event) => {
+          console.error("Speech recognition error:", event.error);
+          setIsListening(false);
+        };
+      }
+    }
+  }, []);
+
+  // Toggle voice input
+  const toggleVoiceInput = useCallback(() => {
+    if (!recognitionRef.current) return;
+
+    if (isListening) {
+      recognitionRef.current.stop();
+      setIsListening(false);
+    } else {
+      setInputValue("");
+      recognitionRef.current.start();
+      setIsListening(true);
+    }
+  }, [isListening]);
 
   // Keep ref in sync with state for use in callbacks
   useEffect(() => {
@@ -124,9 +174,36 @@ export default function ChatPage() {
       setMessages([{ ...WELCOME_MESSAGE, timestamp: new Date() }]);
       setError(null);
       setSidebarOpen(false);
-    } catch (err) {
+    } catch (err: unknown) {
+      const firebaseError = err as { code?: string; message?: string };
       console.error("Error creating new chat:", err);
-      setError("Failed to create new chat. Please try again.");
+
+      const isPermissionError =
+        firebaseError.message?.includes("permission") ||
+        firebaseError.code === "permission-denied";
+
+      if (isPermissionError) {
+        // Create local-only chat without Firestore
+        const localChatId = `local-${Date.now()}`;
+        const newConversation: ChatConversation = {
+          id: localChatId,
+          userId: user.uid,
+          title: "New Chat",
+          type: "ai_support",
+          status: "active",
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          lastMessage: "",
+          messageCount: 0,
+        };
+        setConversations((prev) => [newConversation, ...prev]);
+        setActiveConversationId(localChatId);
+        setMessages([{ ...WELCOME_MESSAGE, timestamp: new Date() }]);
+        setError(null);
+        setSidebarOpen(false);
+      } else {
+        setError("Failed to create new chat. Please try again.");
+      }
     } finally {
       setActionLoading(null);
     }
@@ -137,6 +214,15 @@ export default function ChatPage() {
     setActionLoading(conversationId);
     try {
       setActiveConversationId(conversationId);
+
+      // Skip Firestore for local chats
+      if (conversationId.startsWith("local-")) {
+        setMessages([{ ...WELCOME_MESSAGE, timestamp: new Date() }]);
+        setError(null);
+        setSidebarOpen(false);
+        return;
+      }
+
       const existingMessages = await getMessages(conversationId);
 
       if (existingMessages.length > 0) {
@@ -153,9 +239,22 @@ export default function ChatPage() {
       }
       setError(null);
       setSidebarOpen(false);
-    } catch (err) {
+    } catch (err: unknown) {
+      const firebaseError = err as { code?: string; message?: string };
       console.error("Error loading conversation:", err);
-      setError("Failed to load conversation. Please try again.");
+
+      const isPermissionError =
+        firebaseError.message?.includes("permission") ||
+        firebaseError.code === "permission-denied";
+
+      if (isPermissionError) {
+        // Fall back to welcome message for permission errors
+        setMessages([{ ...WELCOME_MESSAGE, timestamp: new Date() }]);
+        setError(null);
+      } else {
+        setError("Failed to load conversation. Please try again.");
+      }
+      setSidebarOpen(false);
     } finally {
       setActionLoading(null);
     }
@@ -166,8 +265,35 @@ export default function ChatPage() {
     if (!user) return;
 
     try {
-      const userConversations = await getUserConversations(user.uid);
-      setConversations(userConversations);
+      // Load user profile for agent context - handle permission errors gracefully
+      try {
+        const profile = await getUserProfile(user.uid);
+        setUserProfile(profile);
+      } catch (profileErr) {
+        console.warn("Could not load user profile:", profileErr);
+        // Continue without profile - chat can still work
+      }
+
+      // Try to load conversations - handle permission errors
+      let userConversations: ChatConversation[] = [];
+      try {
+        userConversations = await getUserConversations(user.uid);
+        setConversations(userConversations);
+      } catch (convErr: unknown) {
+        const firebaseError = convErr as { code?: string; message?: string };
+        console.warn("Could not load conversations:", convErr);
+
+        const isPermissionError =
+          firebaseError.message?.includes("permission") ||
+          firebaseError.code === "permission-denied";
+
+        if (isPermissionError) {
+          // Permission error - create a local chat instead
+          await handleNewChat();
+          setLoading(false);
+          return;
+        }
+      }
 
       if (userConversations.length > 0) {
         await loadConversation(userConversations[0].id);
@@ -175,9 +301,20 @@ export default function ChatPage() {
         await handleNewChat();
       }
       setError(null);
-    } catch (err) {
+    } catch (err: unknown) {
+      const firebaseError = err as { code?: string; message?: string };
       console.error("Error loading conversations:", err);
-      setError("Failed to load conversations. Please try again.");
+
+      const isPermissionError =
+        firebaseError.message?.includes("permission") ||
+        firebaseError.code === "permission-denied";
+
+      if (isPermissionError) {
+        // Still allow chat to work locally without cloud sync
+        setError(null); // Don't show error - just use local chat
+      } else {
+        setError("Failed to load conversations. Please try again.");
+      }
       await handleNewChat();
     } finally {
       setLoading(false);
@@ -201,7 +338,14 @@ export default function ChatPage() {
     async (conversationId: string) => {
       setActionLoading(`delete-${conversationId}`);
       try {
-        await deleteConversation(conversationId);
+        // Only delete from Firestore if not a local chat
+        if (!conversationId.startsWith("local-")) {
+          try {
+            await deleteConversation(conversationId);
+          } catch (firestoreErr) {
+            console.warn("Could not delete from Firestore:", firestoreErr);
+          }
+        }
 
         setConversations((prev) => {
           const remaining = prev.filter((c) => c.id !== conversationId);
@@ -239,7 +383,18 @@ export default function ChatPage() {
 
       setActionLoading(`rename-${conversationId}`);
       try {
-        await updateConversationTitle(conversationId, editTitleValue.trim());
+        // Only update Firestore if not a local chat
+        if (!conversationId.startsWith("local-")) {
+          try {
+            await updateConversationTitle(
+              conversationId,
+              editTitleValue.trim(),
+            );
+          } catch (firestoreErr) {
+            console.warn("Could not update title in Firestore:", firestoreErr);
+          }
+        }
+
         setConversations((prev) =>
           prev.map((c) =>
             c.id === conversationId
@@ -282,7 +437,10 @@ export default function ChatPage() {
         timestamp: new Date(),
       };
 
-      setMessages((prev) => [...prev, userMessage]);
+      // Get current messages before updating state
+      const currentMessages = [...messages, userMessage];
+
+      setMessages(currentMessages);
       setInputValue("");
       if (inputRef.current) {
         inputRef.current.style.height = "auto";
@@ -291,44 +449,126 @@ export default function ChatPage() {
       setError(null);
 
       try {
-        await addMessage(activeConversationId, {
-          conversationId: activeConversationId,
-          sender: "user",
-          content: text.trim(),
-        });
+        // Only save to Firestore if not a local chat
+        const isLocalChat = activeConversationId.startsWith("local-");
 
-        await updateConversationPreview(activeConversationId, text.trim());
+        if (!isLocalChat) {
+          try {
+            await addMessage(activeConversationId, {
+              conversationId: activeConversationId,
+              sender: "user",
+              content: text.trim(),
+            });
 
-        const currentConversation = conversationsRef.current.find(
-          (c) => c.id === activeConversationId,
-        );
-        if (currentConversation?.title === "New Chat") {
-          const newTitle = generateTitleFromMessage(text.trim());
-          await updateConversationTitle(activeConversationId, newTitle);
-          setConversations((prev) =>
-            prev.map((c) =>
-              c.id === activeConversationId ? { ...c, title: newTitle } : c,
-            ),
+            await updateConversationPreview(activeConversationId, text.trim());
+
+            const currentConversation = conversationsRef.current.find(
+              (c) => c.id === activeConversationId,
+            );
+            if (currentConversation?.title === "New Chat") {
+              const newTitle = generateTitleFromMessage(text.trim());
+              await updateConversationTitle(activeConversationId, newTitle);
+              setConversations((prev) =>
+                prev.map((c) =>
+                  c.id === activeConversationId ? { ...c, title: newTitle } : c,
+                ),
+              );
+            }
+          } catch (firestoreErr) {
+            // Silently handle Firestore errors - chat still works
+            console.warn("Could not save to Firestore:", firestoreErr);
+          }
+        } else {
+          // For local chats, just update the title locally
+          const currentConversation = conversationsRef.current.find(
+            (c) => c.id === activeConversationId,
           );
+          if (currentConversation?.title === "New Chat") {
+            const newTitle = generateTitleFromMessage(text.trim());
+            setConversations((prev) =>
+              prev.map((c) =>
+                c.id === activeConversationId ? { ...c, title: newTitle } : c,
+              ),
+            );
+          }
         }
 
-        const conversationHistory = messages.slice(-10).map((msg) => ({
+        // Use currentMessages which includes the new user message
+        const conversationHistory = currentMessages.slice(-10).map((msg) => ({
           role: msg.sender === "user" ? "user" : "assistant",
           content: msg.text,
         }));
 
-        const response = await fetch("/api/chat", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            message: text.trim(),
-            conversationHistory,
-          }),
-        });
+        // Send message to AI Agent with user context
+        const makeRequest = async (
+          retryCount = 0,
+        ): Promise<{ response: string }> => {
+          const res = await fetch("/api/chat", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              message: text.trim(),
+              conversationHistory,
+              userId: user.uid,
+              userProfile: userProfile
+                ? {
+                    displayName: userProfile.displayName,
+                    onboardingCompleted: userProfile.onboardingCompleted,
+                  }
+                : undefined,
+              cycleData: userProfile?.cycleData
+                ? {
+                    lastPeriodDate: userProfile.cycleData.lastPeriodDate,
+                    cycleLength: userProfile.cycleData.cycleLength,
+                    periodLength: userProfile.cycleData.periodLength,
+                    nextPeriodDate: userProfile.cycleData.nextPeriodDate,
+                    currentPhase: userProfile.cycleData.currentPhase,
+                  }
+                : undefined,
+            }),
+          });
 
-        const data = await response.json();
+          const data = await res.json();
 
-        if (response.ok && data.response) {
+          // Handle rate limiting with auto-retry
+          if (res.status === 429 && retryCount < 2) {
+            const retryAfter = parseInt(
+              res.headers.get("Retry-After") || "30",
+              10,
+            );
+
+            // Show temporary waiting message
+            const waitMessage: Message = {
+              id: `wait-${Date.now()}`,
+              sender: "sister",
+              text: `${data.response || "I'm thinking... please wait a moment!"} ⏳`,
+              timestamp: new Date(),
+            };
+            setMessages((prev) => [...prev, waitMessage]);
+
+            // Wait and retry
+            await new Promise((resolve) =>
+              setTimeout(resolve, retryAfter * 1000),
+            );
+
+            // Remove the waiting message before retry
+            setMessages((prev) => prev.filter((m) => m.id !== waitMessage.id));
+
+            return makeRequest(retryCount + 1);
+          }
+
+          if (!res.ok) {
+            throw new Error(
+              data.response || data.error || "Failed to get response",
+            );
+          }
+
+          return data;
+        };
+
+        const data = await makeRequest();
+
+        if (data.response) {
           const sisterMessage: Message = {
             id: `sister-${Date.now()}`,
             sender: "sister",
@@ -338,13 +578,27 @@ export default function ChatPage() {
 
           setMessages((prev) => [...prev, sisterMessage]);
 
-          await addMessage(activeConversationId, {
-            conversationId: activeConversationId,
-            sender: "ai",
-            content: data.response,
-          });
+          // Only save to Firestore if not a local chat
+          if (!isLocalChat) {
+            try {
+              await addMessage(activeConversationId, {
+                conversationId: activeConversationId,
+                sender: "ai",
+                content: data.response,
+              });
 
-          await updateConversationPreview(activeConversationId, data.response);
+              await updateConversationPreview(
+                activeConversationId,
+                data.response,
+              );
+            } catch (firestoreErr) {
+              // Silently handle Firestore errors - chat still works
+              console.warn(
+                "Could not save AI response to Firestore:",
+                firestoreErr,
+              );
+            }
+          }
 
           setConversations((prev) =>
             prev.map((c) =>
@@ -357,8 +611,6 @@ export default function ChatPage() {
                 : c,
             ),
           );
-        } else {
-          throw new Error(data.error || "Failed to get response");
         }
       } catch (err) {
         console.error("Error sending message:", err);
@@ -374,7 +626,13 @@ export default function ChatPage() {
         setIsTyping(false);
       }
     },
-    [user, activeConversationId, messages, generateTitleFromMessage],
+    [
+      user,
+      activeConversationId,
+      messages,
+      generateTitleFromMessage,
+      userProfile,
+    ],
   );
 
   const handleSubmit = (e: React.FormEvent) => {
@@ -418,10 +676,10 @@ export default function ChatPage() {
 
   if (authLoading || loading) {
     return (
-      <div className="min-h-screen bg-background-light dark:bg-background-dark flex items-center justify-center">
+      <div className="min-h-screen bg-background-light dark:bg-background-dark flex items-center justify-center safe-top safe-bottom">
         <div className="flex flex-col items-center gap-4">
-          <div className="w-12 h-12 border-4 border-primary border-t-transparent rounded-full animate-spin" />
-          <p className="text-text-secondary dark:text-gray-400">
+          <div className="w-10 h-10 sm:w-12 sm:h-12 border-4 border-primary border-t-transparent rounded-full animate-spin" />
+          <p className="text-text-secondary dark:text-gray-400 text-sm sm:text-base">
             Loading chat...
           </p>
         </div>
@@ -452,43 +710,43 @@ export default function ChatPage() {
             border-r border-border-light dark:border-border-dark 
             transition-all duration-300 ease-out
             ${sidebarOpen ? "translate-x-0 shadow-2xl" : "-translate-x-full lg:translate-x-0"}
-            w-80 lg:w-72
+            w-[85vw] xs:w-80 sm:w-80 lg:w-72
           `}
         >
           <div className="flex flex-col h-full">
             {/* Sidebar Header */}
-            <div className="flex items-center justify-between p-4 border-b border-border-light dark:border-border-dark">
-              <div className="flex items-center gap-3">
-                <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-primary to-purple-600 flex items-center justify-center shadow-lg shadow-primary/20">
-                  <span className="material-symbols-outlined text-white text-xl">
+            <div className="flex items-center justify-between p-3 sm:p-4 border-b border-border-light dark:border-border-dark">
+              <div className="flex items-center gap-2 sm:gap-3">
+                <div className="w-8 h-8 sm:w-10 sm:h-10 rounded-lg sm:rounded-xl bg-gradient-to-br from-primary to-purple-600 flex items-center justify-center shadow-lg shadow-primary/20">
+                  <span className="material-symbols-outlined text-white text-lg sm:text-xl">
                     chat
                   </span>
                 </div>
                 <div>
-                  <h2 className="font-semibold text-text-primary dark:text-white text-sm">
+                  <h2 className="font-semibold text-text-primary dark:text-white text-xs sm:text-sm">
                     Chat History
                   </h2>
-                  <p className="text-xs text-text-secondary dark:text-gray-400">
+                  <p className="text-[10px] sm:text-xs text-text-secondary dark:text-gray-400">
                     {conversations.length} conversations
                   </p>
                 </div>
               </div>
               <button
                 onClick={() => setSidebarOpen(false)}
-                className="p-2 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-xl transition-colors lg:hidden"
+                className="p-1.5 sm:p-2 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-lg sm:rounded-xl transition-colors lg:hidden touch-target"
               >
-                <span className="material-symbols-outlined text-text-secondary dark:text-gray-400">
+                <span className="material-symbols-outlined text-text-secondary dark:text-gray-400 text-xl">
                   close
                 </span>
               </button>
             </div>
 
             {/* New Chat Button */}
-            <div className="p-3">
+            <div className="p-2 sm:p-3">
               <button
                 onClick={handleNewChat}
                 disabled={actionLoading === "new"}
-                className="w-full flex items-center justify-center gap-2 px-4 py-3 bg-gradient-to-r from-primary to-purple-600 hover:from-primary/90 hover:to-purple-600/90 text-white rounded-xl font-medium text-sm transition-all shadow-lg shadow-primary/25 disabled:opacity-50"
+                className="w-full flex items-center justify-center gap-2 px-3 sm:px-4 py-2.5 sm:py-3 bg-gradient-to-r from-primary to-purple-600 hover:from-primary/90 hover:to-purple-600/90 text-white rounded-lg sm:rounded-xl font-medium text-xs sm:text-sm transition-all shadow-lg shadow-primary/25 disabled:opacity-50 touch-target"
               >
                 {actionLoading === "new" ? (
                   <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" />
@@ -504,9 +762,9 @@ export default function ChatPage() {
             </div>
 
             {/* Search Conversations */}
-            <div className="px-3 pb-2">
+            <div className="px-2 sm:px-3 pb-2">
               <div className="relative">
-                <span className="material-symbols-outlined absolute left-3 top-1/2 -translate-y-1/2 text-text-secondary dark:text-gray-400 text-lg">
+                <span className="material-symbols-outlined absolute left-2.5 sm:left-3 top-1/2 -translate-y-1/2 text-text-secondary dark:text-gray-400 text-base sm:text-lg">
                   search
                 </span>
                 <input
@@ -514,7 +772,7 @@ export default function ChatPage() {
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
                   placeholder="Search conversations..."
-                  className="w-full pl-10 pr-4 py-2.5 bg-gray-100 dark:bg-gray-800 border-none rounded-xl text-sm text-text-primary dark:text-white placeholder:text-text-secondary focus:ring-2 focus:ring-primary/50 transition-all"
+                  className="w-full pl-9 sm:pl-10 pr-3 sm:pr-4 py-2 sm:py-2.5 bg-gray-100 dark:bg-gray-800 border-none rounded-lg sm:rounded-xl text-xs sm:text-sm text-text-primary dark:text-white placeholder:text-text-secondary focus:ring-2 focus:ring-primary/50 transition-all"
                 />
               </div>
             </div>
@@ -776,38 +1034,38 @@ export default function ChatPage() {
 
           {/* Messages Container */}
           <div className="flex-1 overflow-y-auto bg-gray-50 dark:bg-background-dark">
-            <div className="max-w-3xl mx-auto px-4 py-6 space-y-6">
+            <div className="max-w-3xl mx-auto px-3 sm:px-4 py-4 sm:py-6 space-y-4 sm:space-y-6">
               {messages.map((message) => (
                 <div
                   key={message.id}
-                  className={`flex gap-4 animate-fade-in ${message.sender === "user" ? "flex-row-reverse" : ""}`}
+                  className={`flex gap-2 sm:gap-4 animate-fade-in ${message.sender === "user" ? "flex-row-reverse" : ""}`}
                 >
                   {/* Avatar */}
                   <div
-                    className={`shrink-0 w-10 h-10 rounded-xl flex items-center justify-center shadow-md ${
+                    className={`shrink-0 w-8 h-8 sm:w-10 sm:h-10 rounded-lg sm:rounded-xl flex items-center justify-center shadow-md ${
                       message.sender === "sister"
                         ? "bg-gradient-to-br from-primary to-purple-600"
                         : "bg-gradient-to-br from-orange-400 to-pink-500"
                     }`}
                   >
-                    <span className="material-symbols-outlined text-white text-lg">
+                    <span className="material-symbols-outlined text-white text-base sm:text-lg">
                       {message.sender === "sister" ? "spa" : "person"}
                     </span>
                   </div>
 
                   {/* Message Bubble */}
                   <div
-                    className={`flex-1 max-w-[80%] ${message.sender === "user" ? "flex flex-col items-end" : ""}`}
+                    className={`flex-1 max-w-[85%] sm:max-w-[80%] ${message.sender === "user" ? "flex flex-col items-end" : ""}`}
                   >
                     <div
-                      className={`px-4 py-3 rounded-2xl shadow-sm ${
+                      className={`px-3 sm:px-4 py-2.5 sm:py-3 rounded-xl sm:rounded-2xl shadow-sm ${
                         message.sender === "sister"
-                          ? "bg-white dark:bg-card-dark rounded-tl-md"
-                          : "bg-gradient-to-r from-primary to-purple-600 text-white rounded-tr-md"
+                          ? "bg-white dark:bg-card-dark rounded-tl-sm sm:rounded-tl-md"
+                          : "bg-gradient-to-r from-primary to-purple-600 text-white rounded-tr-sm sm:rounded-tr-md"
                       }`}
                     >
                       <p
-                        className={`text-sm leading-relaxed whitespace-pre-wrap ${
+                        className={`text-xs sm:text-sm leading-relaxed whitespace-pre-wrap ${
                           message.sender === "sister"
                             ? "text-text-primary dark:text-gray-200"
                             : "text-white"
@@ -816,7 +1074,7 @@ export default function ChatPage() {
                         {message.text}
                       </p>
                     </div>
-                    <p className="text-[10px] text-text-secondary dark:text-gray-500 mt-1 px-1">
+                    <p className="text-[9px] sm:text-[10px] text-text-secondary dark:text-gray-500 mt-1 px-1">
                       {message.timestamp.toLocaleTimeString([], {
                         hour: "2-digit",
                         minute: "2-digit",
@@ -828,24 +1086,24 @@ export default function ChatPage() {
 
               {/* Typing Indicator */}
               {isTyping && (
-                <div className="flex gap-4 animate-fade-in">
-                  <div className="shrink-0 w-10 h-10 rounded-xl bg-gradient-to-br from-primary to-purple-600 flex items-center justify-center shadow-md">
-                    <span className="material-symbols-outlined text-white text-lg">
+                <div className="flex gap-2 sm:gap-4 animate-fade-in">
+                  <div className="shrink-0 w-8 h-8 sm:w-10 sm:h-10 rounded-lg sm:rounded-xl bg-gradient-to-br from-primary to-purple-600 flex items-center justify-center shadow-md">
+                    <span className="material-symbols-outlined text-white text-base sm:text-lg">
                       spa
                     </span>
                   </div>
-                  <div className="bg-white dark:bg-card-dark rounded-2xl rounded-tl-md px-5 py-4 shadow-sm">
+                  <div className="bg-white dark:bg-card-dark rounded-xl sm:rounded-2xl rounded-tl-sm sm:rounded-tl-md px-4 sm:px-5 py-3 sm:py-4 shadow-sm">
                     <div className="flex gap-1.5">
                       <span
-                        className="w-2 h-2 bg-primary rounded-full animate-bounce"
+                        className="w-1.5 h-1.5 sm:w-2 sm:h-2 bg-primary rounded-full animate-bounce"
                         style={{ animationDelay: "0ms" }}
                       />
                       <span
-                        className="w-2 h-2 bg-primary rounded-full animate-bounce"
+                        className="w-1.5 h-1.5 sm:w-2 sm:h-2 bg-primary rounded-full animate-bounce"
                         style={{ animationDelay: "150ms" }}
                       />
                       <span
-                        className="w-2 h-2 bg-primary rounded-full animate-bounce"
+                        className="w-1.5 h-1.5 sm:w-2 sm:h-2 bg-primary rounded-full animate-bounce"
                         style={{ animationDelay: "300ms" }}
                       />
                     </div>
@@ -857,26 +1115,26 @@ export default function ChatPage() {
             </div>
           </div>
 
-          {/* Input Area */}
-          <div className="border-t border-border-light dark:border-border-dark bg-white dark:bg-card-dark">
-            <div className="max-w-3xl mx-auto px-4 py-4">
+          {/* Input Area - positioned above bottom nav */}
+          <div className="border-t border-border-light dark:border-border-dark bg-white dark:bg-card-dark pb-[calc(var(--bottom-nav-height,72px)+env(safe-area-inset-bottom))] lg:pb-4">
+            <div className="max-w-3xl mx-auto px-3 sm:px-4 py-3 sm:py-4">
               {/* Icebreakers for new chats */}
               {messages.length <= 1 && (
-                <div className="grid grid-cols-2 gap-3 mb-4">
+                <div className="grid grid-cols-1 xs:grid-cols-2 gap-2 sm:gap-3 mb-3 sm:mb-4">
                   {icebreakers.map((icebreaker) => (
                     <button
                       key={icebreaker.text}
                       onClick={() => sendMessage(icebreaker.text)}
-                      className="flex items-center gap-3 p-4 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-2xl hover:border-primary hover:shadow-md transition-all text-left group"
+                      className="flex items-center gap-2 sm:gap-3 p-2.5 sm:p-4 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl sm:rounded-2xl hover:border-primary hover:shadow-md transition-all text-left group touch-target"
                     >
                       <div
-                        className={`w-10 h-10 rounded-xl bg-gradient-to-br ${icebreaker.color} flex items-center justify-center shrink-0`}
+                        className={`w-8 h-8 sm:w-10 sm:h-10 rounded-lg sm:rounded-xl bg-gradient-to-br ${icebreaker.color} flex items-center justify-center shrink-0`}
                       >
-                        <span className="material-symbols-outlined text-white text-lg">
+                        <span className="material-symbols-outlined text-white text-sm sm:text-lg">
                           {icebreaker.icon}
                         </span>
                       </div>
-                      <span className="text-sm text-text-primary dark:text-gray-300 leading-tight">
+                      <span className="text-xs sm:text-sm text-text-primary dark:text-gray-300 leading-tight">
                         {icebreaker.text}
                       </span>
                     </button>
@@ -886,30 +1144,50 @@ export default function ChatPage() {
 
               {/* Input Box */}
               <form onSubmit={handleSubmit} className="relative">
-                <div className="flex items-end gap-3 bg-gray-100 dark:bg-gray-800 rounded-2xl p-2 border-2 border-transparent focus-within:border-primary focus-within:bg-white dark:focus-within:bg-gray-900 transition-all">
+                <div className="flex items-end gap-2 sm:gap-3 bg-gray-100 dark:bg-gray-800 rounded-xl sm:rounded-2xl p-1.5 sm:p-2 border-2 border-transparent focus-within:border-primary focus-within:bg-white dark:focus-within:bg-gray-900 transition-all">
                   <textarea
                     ref={inputRef}
                     value={inputValue}
                     onChange={handleInputChange}
                     onKeyDown={handleKeyDown}
-                    placeholder="Message Sister..."
-                    disabled={isTyping}
+                    placeholder={
+                      isListening ? "Listening..." : "Message Sister..."
+                    }
+                    disabled={isTyping || isListening}
                     rows={1}
-                    className="flex-1 bg-transparent resize-none border-none focus:ring-0 focus:outline-none text-text-primary dark:text-white placeholder:text-text-secondary text-sm px-3 py-2 max-h-[150px]"
+                    className="flex-1 bg-transparent resize-none border-none focus:ring-0 focus:outline-none text-text-primary dark:text-white placeholder:text-text-secondary text-xs sm:text-sm px-2 sm:px-3 py-2 max-h-[120px] sm:max-h-[150px]"
                   />
+                  {/* Voice Input Button */}
+                  {speechSupported && (
+                    <button
+                      type="button"
+                      onClick={toggleVoiceInput}
+                      disabled={isTyping}
+                      className={`p-2.5 sm:p-3 rounded-lg sm:rounded-xl transition-all touch-target ${
+                        isListening
+                          ? "bg-red-500 text-white animate-pulse shadow-lg shadow-red-500/40"
+                          : "bg-gray-200 dark:bg-gray-700 text-text-secondary dark:text-gray-400 hover:bg-gray-300 dark:hover:bg-gray-600"
+                      }`}
+                      title={isListening ? "Stop listening" : "Voice input"}
+                    >
+                      <span className="material-symbols-outlined text-base sm:text-lg">
+                        {isListening ? "mic_off" : "mic"}
+                      </span>
+                    </button>
+                  )}
                   <button
                     type="submit"
                     disabled={!inputValue.trim() || isTyping}
-                    className="p-3 rounded-xl bg-gradient-to-r from-primary to-purple-600 text-white hover:opacity-90 transition-all disabled:opacity-40 disabled:cursor-not-allowed shadow-lg shadow-primary/25"
+                    className="p-2.5 sm:p-3 rounded-lg sm:rounded-xl bg-gradient-to-r from-primary to-purple-600 text-white hover:opacity-90 transition-all disabled:opacity-40 disabled:cursor-not-allowed shadow-lg shadow-primary/25 touch-target"
                   >
-                    <span className="material-symbols-outlined text-lg">
+                    <span className="material-symbols-outlined text-base sm:text-lg">
                       send
                     </span>
                   </button>
                 </div>
               </form>
 
-              <p className="text-center text-[10px] text-text-secondary dark:text-gray-500 mt-3">
+              <p className="text-center text-[9px] sm:text-[10px] text-text-secondary dark:text-gray-500 mt-2 sm:mt-3">
                 Sister is an AI companion. For emergencies, call{" "}
                 <a
                   href="tel:116"

@@ -3,6 +3,7 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "@/context/AuthContext";
+import { useLanguage } from "@/context/LanguageContext";
 import Header from "@/components/layout/Header";
 import Footer from "@/components/layout/Footer";
 import Card from "@/components/ui/Card";
@@ -17,36 +18,12 @@ import {
 } from "@/lib/firestore";
 import { UserProfile, MoodType } from "@/types";
 
-const moods: { emoji: string; label: string; value: MoodType }[] = [
-  { emoji: "😊", label: "Good", value: "good" },
-  { emoji: "😴", label: "Tired", value: "okay" },
-  { emoji: "😔", label: "Low", value: "low" },
-  { emoji: "🤩", label: "Great", value: "great" },
-];
-
-const phaseInfo: Record<string, { color: string; tip: string; title: string }> =
-  {
-    menstrual: {
-      color: "text-red-500",
-      title: "Rest and Nurture",
-      tip: "Your body is shedding its lining. Focus on rest, gentle movement, and iron-rich foods. It's okay to take it easy.",
-    },
-    follicular: {
-      color: "text-green-500",
-      title: "Energy Rising",
-      tip: "Estrogen is rising! Great time for creative projects, learning new things, and social activities. Energy levels are increasing.",
-    },
-    ovulation: {
-      color: "text-amber-500",
-      title: "Peak Energy",
-      tip: "You're at peak energy and fertility. Communication skills are enhanced. Great time for important conversations and presentations.",
-    },
-    luteal: {
-      color: "text-purple-500",
-      title: "Wind Down",
-      tip: "Progesterone rises, preparing for potential pregnancy. Focus on completing tasks, self-care, and preparing for your upcoming period.",
-    },
-  };
+const phaseColors: Record<string, string> = {
+  menstrual: "text-red-500",
+  follicular: "text-green-500",
+  ovulation: "text-amber-500",
+  luteal: "text-purple-500",
+};
 
 export default function DashboardPage() {
   const {
@@ -55,6 +32,7 @@ export default function DashboardPage() {
     loading: authLoading,
     refreshProfile,
   } = useAuth();
+  const { t, language } = useLanguage();
   const router = useRouter();
 
   const [profile, setProfile] = useState<UserProfile | null>(null);
@@ -106,15 +84,32 @@ export default function DashboardPage() {
 
         // Only mark as checked if onboarding is complete
         setOnboardingChecked(true);
-      } catch (err) {
+      } catch (err: unknown) {
+        const firebaseError = err as { code?: string; message?: string };
         console.error("Error checking onboarding:", err);
-        // On error, redirect to onboarding to be safe
-        router.replace("/onboarding");
+
+        // Check if it's a permission error
+        const isPermissionError =
+          firebaseError.message?.includes("permission") ||
+          firebaseError.code === "permission-denied";
+
+        if (isPermissionError) {
+          // If permission error but user is authenticated, use authProfile or allow access
+          if (authProfile?.onboardingCompleted) {
+            setOnboardingChecked(true);
+          } else {
+            // Show dashboard anyway - user can use it without Firestore temporarily
+            setOnboardingChecked(true);
+          }
+        } else {
+          // On other errors, redirect to onboarding to be safe
+          router.replace("/onboarding");
+        }
       }
     };
 
     checkOnboarding();
-  }, [user, authLoading, router]);
+  }, [user, authLoading, router, authProfile]);
 
   // Load dashboard data only AFTER onboarding is verified
   useEffect(() => {
@@ -140,13 +135,40 @@ export default function DashboardPage() {
           setCycleInfo(info);
         }
       }
-    } catch (err) {
+    } catch (err: unknown) {
+      const firebaseError = err as { code?: string; message?: string };
       console.error("Error loading dashboard data:", err);
-      setError("Unable to load your dashboard. Please try again.");
+
+      // Check if it's a permission error
+      const isPermissionError =
+        firebaseError.message?.includes("permission") ||
+        firebaseError.code === "permission-denied";
+
+      if (isPermissionError) {
+        // Use authProfile if available
+        if (authProfile) {
+          setProfile(authProfile);
+          if (authProfile.cycleData) {
+            const { lastPeriodDate, cycleLength, periodLength } =
+              authProfile.cycleData;
+            if (lastPeriodDate && cycleLength && periodLength) {
+              const info = getCycleInfo(
+                lastPeriodDate,
+                cycleLength,
+                periodLength,
+              );
+              setCycleInfo(info);
+            }
+          }
+        }
+        setError("Cloud sync unavailable. Some features may be limited.");
+      } else {
+        setError("Unable to load your dashboard. Please try again.");
+      }
     } finally {
       setLoading(false);
     }
-  }, [user, router]);
+  }, [user, authProfile]);
 
   const handleMoodSelect = async (mood: MoodType) => {
     if (moodLogging) return;
@@ -173,9 +195,25 @@ export default function DashboardPage() {
         setMoodLogged(false);
         setSelectedMood(null);
       }, 3000);
-    } catch (err) {
+    } catch (err: unknown) {
+      const firebaseError = err as { code?: string; message?: string };
       console.error("Error logging mood:", err);
-      setSelectedMood(null);
+
+      // For permission errors, still show success locally
+      const isPermissionError =
+        firebaseError.message?.includes("permission") ||
+        firebaseError.code === "permission-denied";
+
+      if (isPermissionError) {
+        // Show success locally even if couldn't save to cloud
+        setMoodLogged(true);
+        setTimeout(() => {
+          setMoodLogged(false);
+          setSelectedMood(null);
+        }, 3000);
+      } else {
+        setSelectedMood(null);
+      }
     } finally {
       setMoodLogging(false);
     }
@@ -208,9 +246,31 @@ export default function DashboardPage() {
     return { days, hours, minutes, isPeriodActive, nextPeriodDate: nextPeriod };
   }, [cycleInfo, currentTime]);
 
+  // Get current phase info with translations
   const currentPhaseInfo = useMemo(() => {
-    return cycleInfo ? phaseInfo[cycleInfo.phase] : phaseInfo.follicular;
-  }, [cycleInfo]);
+    const phase = cycleInfo?.phase || "follicular";
+    const phaseKey = phase as
+      | "menstrual"
+      | "follicular"
+      | "ovulation"
+      | "luteal";
+    return {
+      color: phaseColors[phase] || phaseColors.follicular,
+      title: t.dashboard.phaseTitles[phaseKey],
+      tip: t.dashboard.phaseTips[phaseKey],
+    };
+  }, [cycleInfo, t]);
+
+  // Moods with translations
+  const moods: { emoji: string; label: string; value: MoodType }[] = useMemo(
+    () => [
+      { emoji: "😊", label: t.dashboard.moods.good, value: "good" },
+      { emoji: "😴", label: t.dashboard.moods.tired, value: "okay" },
+      { emoji: "😔", label: t.dashboard.moods.low, value: "low" },
+      { emoji: "🤩", label: t.dashboard.moods.great, value: "great" },
+    ],
+    [t],
+  );
 
   // Show loading while checking auth OR onboarding status OR loading data
   if (authLoading || !onboardingChecked || loading) {
@@ -220,8 +280,8 @@ export default function DashboardPage() {
           <div className="w-12 h-12 border-4 border-primary border-t-transparent rounded-full animate-spin" />
           <p className="text-text-secondary">
             {!onboardingChecked
-              ? "Checking your profile..."
-              : "Loading your dashboard..."}
+              ? t.dashboard.checkingProfile
+              : t.dashboard.loadingDashboard}
           </p>
         </div>
       </div>
@@ -238,7 +298,9 @@ export default function DashboardPage() {
           <p className="text-text-primary dark:text-white font-semibold">
             {error}
           </p>
-          <Button onClick={() => loadDashboardData()}>Try Again</Button>
+          <Button onClick={() => loadDashboardData()}>
+            {t.dashboard.tryAgain}
+          </Button>
         </div>
       </div>
     );
@@ -250,11 +312,14 @@ export default function DashboardPage() {
     user?.email?.split("@")[0] ||
     "Sister";
 
+  // Date formatting based on language
+  const dateLocale = language === "lg" ? "en-US" : "en-US"; // Luganda uses English date names for now
+
   return (
-    <div className="layout-container flex flex-col min-h-screen">
+    <div className="flex flex-col min-h-screen">
       <Header variant="app" />
 
-      <main className="flex-1 max-w-[1200px] mx-auto w-full px-6 py-8 pb-24 md:pb-8">
+      <main className="flex-1 max-w-[1200px] mx-auto w-full px-4 sm:px-6 py-5 sm:py-8 main-content">
         {/* Period Reminder Banner */}
         {cycleInfo && (
           <div className="mb-6">
@@ -276,16 +341,17 @@ export default function DashboardPage() {
               </span>
               <div className="flex-1">
                 <h3 className="text-amber-800 dark:text-amber-200 font-bold mb-1">
-                  Period Update Needed
+                  {t.dashboard.periodUpdateNeeded}
                 </h3>
                 <p className="text-amber-700 dark:text-amber-300 text-sm mb-3">
-                  Your period was expected {cycleInfo.daysLate} day
-                  {cycleInfo.daysLate !== 1 ? "s" : ""} ago. Please update when
-                  your period started for accurate tracking.
+                  {t.dashboard.periodUpdateDesc.replace(
+                    "{days}",
+                    String(cycleInfo.daysLate),
+                  )}
                 </p>
                 <Link href="/profile">
                   <Button variant="secondary" size="sm" icon="edit_calendar">
-                    Update Period Date
+                    {t.dashboard.updatePeriodDate}
                   </Button>
                 </Link>
               </div>
@@ -294,128 +360,142 @@ export default function DashboardPage() {
         )}
 
         {/* Page Heading */}
-        <div className="flex flex-wrap justify-between gap-3 mb-8">
-          <div className="flex min-w-72 flex-col gap-1">
-            <p className="text-text-primary dark:text-white text-4xl font-black leading-tight tracking-tight">
-              Welcome back, {displayName}
-            </p>
-            <p className="text-text-secondary text-lg font-normal leading-normal">
-              Your health and emotional well-being at a glance.
+        <div className="flex flex-col sm:flex-row sm:flex-wrap justify-between gap-4 mb-6 sm:mb-8">
+          <div className="flex flex-col gap-1">
+            <h1 className="text-text-primary dark:text-white text-2xl sm:text-3xl md:text-4xl font-black leading-tight tracking-tight">
+              {t.dashboard.welcomeBack}, {displayName}
+            </h1>
+            <p className="text-text-secondary text-sm sm:text-base md:text-lg font-normal leading-normal">
+              {t.dashboard.healthAtGlance}
             </p>
           </div>
-          <div className="flex items-end gap-3">
-            <Link href="/profile">
-              <Button variant="secondary" icon="person">
-                Profile
+          <div className="flex items-center gap-2 sm:gap-3 mt-2 sm:mt-0">
+            <Link href="/profile" className="flex-1 sm:flex-none">
+              <Button
+                variant="secondary"
+                icon="person"
+                className="w-full sm:w-auto"
+              >
+                {t.nav.profile}
               </Button>
             </Link>
-            <Link href="/chat">
-              <Button icon="chat_bubble">Support Chat</Button>
+            <Link href="/chat" className="flex-1 sm:flex-none">
+              <Button icon="chat_bubble" className="w-full sm:w-auto">
+                {t.nav.chat}
+              </Button>
             </Link>
           </div>
         </div>
 
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-5 sm:gap-6 lg:gap-8">
           {/* Main Tracking Column */}
-          <div className="lg:col-span-2 space-y-8">
+          <div className="lg:col-span-2 space-y-5 sm:space-y-6 lg:space-y-8">
             {/* Timer & Status Section */}
             <Card padding="lg">
               <div className="flex flex-col items-center text-center">
                 <span
                   className={`bg-primary/10 ${currentPhaseInfo.color} px-4 py-1 rounded-full text-sm font-bold mb-4 uppercase tracking-wider`}
                 >
-                  Current Phase: {cycleInfo?.phase || "Unknown"}
+                  {t.dashboard.currentPhase}:{" "}
+                  {cycleInfo?.phase
+                    ? t.dashboard.cyclePhases[
+                        cycleInfo.phase as keyof typeof t.dashboard.cyclePhases
+                      ]
+                    : "Unknown"}
                 </span>
 
                 {/* Period-specific messaging */}
                 {countdown.isPeriodActive ? (
                   <div className="mb-6">
                     <h2 className="text-text-primary dark:text-white text-2xl font-bold mb-2">
-                      💜 Take It Easy, Queen
+                      💜 {t.dashboard.takeItEasy}
                     </h2>
                     <p className="text-text-secondary text-base max-w-md">
-                      Day {cycleInfo?.dayInCycle || 1} of your period. Rest,
-                      hydrate, and be gentle with yourself. You&apos;re doing
-                      amazing!
+                      {t.dashboard.periodDayMessage.replace(
+                        "{day}",
+                        String(cycleInfo?.dayInCycle || 1),
+                      )}
                     </p>
                   </div>
                 ) : (
                   <h2 className="text-text-primary dark:text-white text-2xl font-bold mb-6">
-                    Days until your next period
+                    {t.dashboard.daysUntilNextPeriod}
                   </h2>
                 )}
 
                 {/* Timer Component */}
                 {countdown.isPeriodActive && (
-                  <p className="text-text-secondary text-sm mb-3">Time until next cycle:</p>
+                  <p className="text-text-secondary text-xs sm:text-sm mb-3">
+                    {t.dashboard.timeUntilNextCycle}
+                  </p>
                 )}
-                <div className="flex gap-4 w-full max-w-md mx-auto">
-                  <div className="flex grow basis-0 flex-col items-stretch gap-2">
-                    <div className="flex h-16 items-center justify-center rounded-xl bg-border-light dark:bg-border-dark">
-                      <p className="text-primary text-2xl font-black">
+                <div className="flex gap-2 sm:gap-4 w-full max-w-sm sm:max-w-md mx-auto">
+                  <div className="flex grow basis-0 flex-col items-stretch gap-1 sm:gap-2">
+                    <div className="flex h-14 sm:h-16 items-center justify-center rounded-xl bg-border-light dark:bg-border-dark">
+                      <p className="text-primary text-xl sm:text-2xl font-black">
                         {String(countdown.days).padStart(2, "0")}
                       </p>
                     </div>
-                    <p className="text-text-secondary text-xs font-bold uppercase">
-                      Days
+                    <p className="text-text-secondary text-[10px] sm:text-xs font-bold uppercase">
+                      {t.dashboard.timeUnits.days}
                     </p>
                   </div>
-                  <div className="flex grow basis-0 flex-col items-stretch gap-2">
-                    <div className="flex h-16 items-center justify-center rounded-xl bg-border-light dark:bg-border-dark">
-                      <p className="text-text-primary dark:text-white text-2xl font-black">
+                  <div className="flex grow basis-0 flex-col items-stretch gap-1 sm:gap-2">
+                    <div className="flex h-14 sm:h-16 items-center justify-center rounded-xl bg-border-light dark:bg-border-dark">
+                      <p className="text-text-primary dark:text-white text-xl sm:text-2xl font-black">
                         {String(countdown.hours).padStart(2, "0")}
                       </p>
                     </div>
-                    <p className="text-text-secondary text-xs font-bold uppercase">
-                      Hours
+                    <p className="text-text-secondary text-[10px] sm:text-xs font-bold uppercase">
+                      {t.dashboard.timeUnits.hours}
                     </p>
                   </div>
-                  <div className="flex grow basis-0 flex-col items-stretch gap-2">
-                    <div className="flex h-16 items-center justify-center rounded-xl bg-border-light dark:bg-border-dark">
-                      <p className="text-text-primary dark:text-white text-2xl font-black">
+                  <div className="flex grow basis-0 flex-col items-stretch gap-1 sm:gap-2">
+                    <div className="flex h-14 sm:h-16 items-center justify-center rounded-xl bg-border-light dark:bg-border-dark">
+                      <p className="text-text-primary dark:text-white text-xl sm:text-2xl font-black">
                         {String(countdown.minutes).padStart(2, "0")}
                       </p>
                     </div>
-                    <p className="text-text-secondary text-xs font-bold uppercase">
-                      Mins
+                    <p className="text-text-secondary text-[10px] sm:text-xs font-bold uppercase">
+                      {t.dashboard.timeUnits.mins}
                     </p>
                   </div>
                 </div>
 
                 {cycleInfo?.nextPeriodDate && (
                   <p className="text-text-secondary text-base font-medium mt-6">
-                    {countdown.isPeriodActive 
-                      ? `Your period will last about ${profile?.cycleData?.periodLength || 5} days. Next cycle starts` 
-                      : "Next period expected on"}{" "}
-                    {cycleInfo.nextPeriodDate.toLocaleDateString("en-US", {
+                    {countdown.isPeriodActive
+                      ? t.dashboard.periodWillLast.replace(
+                          "{days}",
+                          String(profile?.cycleData?.periodLength || 5),
+                        )
+                      : t.dashboard.nextPeriodExpected}{" "}
+                    {cycleInfo.nextPeriodDate.toLocaleDateString(dateLocale, {
                       month: "long",
                       day: "numeric",
                       year: "numeric",
                     })}
                   </p>
                 )}
-                
+
                 {/* Self-care tip during menstruation */}
                 {countdown.isPeriodActive && (
                   <div className="mt-4 p-4 bg-pink-50 dark:bg-pink-900/20 rounded-xl border border-pink-200 dark:border-pink-800 max-w-md">
                     <p className="text-pink-700 dark:text-pink-300 text-sm flex items-start gap-2">
-                      <span className="material-symbols-outlined text-pink-500 flex-shrink-0">self_care</span>
+                      <span className="material-symbols-outlined text-pink-500 flex-shrink-0">
+                        self_care
+                      </span>
                       <span>
-                        {cycleInfo?.dayInCycle === 1 && (
-                          <><strong>Day 1 tip:</strong> Take it slow today. Your body is working hard. A warm bath or heating pad can be soothing. 🛁</>
-                        )}
-                        {cycleInfo?.dayInCycle === 2 && (
-                          <><strong>Day 2 tip:</strong> Flow is often heaviest today. Stay hydrated and consider iron-rich foods like spinach or lentils. 🥬</>
-                        )}
-                        {cycleInfo?.dayInCycle === 3 && (
-                          <><strong>Day 3 tip:</strong> You might feel more tired. Light stretching or gentle yoga can help with cramps. 🧘‍♀️</>
-                        )}
-                        {cycleInfo?.dayInCycle === 4 && (
-                          <><strong>Day 4 tip:</strong> Energy may start returning. Listen to your body and rest when needed. 💆‍♀️</>
-                        )}
-                        {(cycleInfo?.dayInCycle || 0) >= 5 && (
-                          <><strong>Almost there:</strong> Your period is ending soon. Celebrate making it through! You&apos;re strong. 💪</>
-                        )}
+                        {cycleInfo?.dayInCycle === 1 &&
+                          t.dashboard.periodTips.day1}
+                        {cycleInfo?.dayInCycle === 2 &&
+                          t.dashboard.periodTips.day2}
+                        {cycleInfo?.dayInCycle === 3 &&
+                          t.dashboard.periodTips.day3}
+                        {cycleInfo?.dayInCycle === 4 &&
+                          t.dashboard.periodTips.day4}
+                        {(cycleInfo?.dayInCycle || 0) >= 5 &&
+                          t.dashboard.periodTips.almostThere}
                       </span>
                     </p>
                   </div>
@@ -428,10 +508,14 @@ export default function DashboardPage() {
                       <>
                         <div className="flex justify-between text-xs text-text-secondary mb-2">
                           <span className="flex items-center gap-1">
-                            <span className="material-symbols-outlined text-sm text-pink-500">water_drop</span>
-                            Period Day {cycleInfo.dayInCycle}
+                            <span className="material-symbols-outlined text-sm text-pink-500">
+                              water_drop
+                            </span>
+                            {t.dashboard.periodDay} {cycleInfo.dayInCycle}
                           </span>
-                          <span>~{profile.cycleData.periodLength || 5} days</span>
+                          <span>
+                            ~{profile.cycleData.periodLength || 5} {t.time.days}
+                          </span>
                         </div>
                         <div className="w-full bg-pink-100 dark:bg-pink-900/30 h-3 rounded-full overflow-hidden">
                           <div
@@ -442,16 +526,27 @@ export default function DashboardPage() {
                           />
                         </div>
                         <p className="text-xs text-pink-500 dark:text-pink-400 mt-1 text-center">
-                          {cycleInfo.dayInCycle >= (profile.cycleData.periodLength || 5) 
-                            ? "Your period should be ending soon 🌸" 
-                            : `~${(profile.cycleData.periodLength || 5) - cycleInfo.dayInCycle} days remaining`}
+                          {cycleInfo.dayInCycle >=
+                          (profile.cycleData.periodLength || 5)
+                            ? t.dashboard.periodEndingSoon
+                            : t.dashboard.daysRemaining.replace(
+                                "{days}",
+                                String(
+                                  (profile.cycleData.periodLength || 5) -
+                                    cycleInfo.dayInCycle,
+                                ),
+                              )}
                         </p>
                       </>
                     ) : (
                       <>
                         <div className="flex justify-between text-xs text-text-secondary mb-2">
-                          <span>Day {cycleInfo.dayInCycle}</span>
-                          <span>Day {profile.cycleData.cycleLength}</span>
+                          <span>
+                            {t.time.day} {cycleInfo.dayInCycle}
+                          </span>
+                          <span>
+                            {t.time.day} {profile.cycleData.cycleLength}
+                          </span>
                         </div>
                         <div className="w-full bg-border-light dark:bg-border-dark h-2 rounded-full overflow-hidden">
                           <div
@@ -474,7 +569,7 @@ export default function DashboardPage() {
                 <span className="material-symbols-outlined text-primary">
                   edit_note
                 </span>
-                Your Daily Check-in
+                {t.dashboard.dailyCheckin}
               </h2>
 
               {moodLogged ? (
@@ -483,16 +578,16 @@ export default function DashboardPage() {
                     check_circle
                   </span>
                   <p className="text-green-700 dark:text-green-400 font-semibold">
-                    Mood logged successfully!
+                    {t.dashboard.moodLoggedSuccess}
                   </p>
                   <p className="text-green-600 dark:text-green-500 text-sm">
-                    Thank you for checking in today.
+                    {t.dashboard.thankYouCheckin}
                   </p>
                 </div>
               ) : (
                 <>
                   <p className="text-text-secondary mb-4">
-                    How are you feeling today?
+                    {t.dashboard.welcomeMessage}
                   </p>
                   <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
                     {moods.map((mood) => (
@@ -515,7 +610,7 @@ export default function DashboardPage() {
                   <div className="mt-6">
                     <Link href="/profile">
                       <Button variant="secondary" fullWidth>
-                        Log Detailed Symptoms
+                        {t.dashboard.logDetailedSymptoms}
                       </Button>
                     </Link>
                   </div>
@@ -534,14 +629,13 @@ export default function DashboardPage() {
                   </div>
                   <div className="flex-1">
                     <h3 className="text-amber-800 dark:text-amber-300 font-bold mb-1">
-                      Complete Your Profile
+                      {t.dashboard.completeProfile}
                     </h3>
                     <p className="text-amber-700 dark:text-amber-400 text-sm mb-4">
-                      Add your cycle information to get accurate predictions and
-                      personalized reminders.
+                      {t.dashboard.completeProfileDesc}
                     </p>
                     <Link href="/onboarding">
-                      <Button>Complete Setup</Button>
+                      <Button>{t.dashboard.completeSetup}</Button>
                     </Link>
                   </div>
                 </div>
@@ -550,7 +644,7 @@ export default function DashboardPage() {
           </div>
 
           {/* Side Column */}
-          <div className="space-y-8">
+          <div className="space-y-5 sm:space-y-6 lg:space-y-8">
             {/* Daily Tip Card */}
             <div className="bg-border-light dark:bg-border-dark p-6 rounded-2xl relative overflow-hidden group">
               <div className="relative z-10">
@@ -559,7 +653,7 @@ export default function DashboardPage() {
                     lightbulb
                   </span>
                   <span className="text-primary font-bold uppercase text-xs tracking-widest">
-                    Daily Tip
+                    {t.dashboard.dailyTip}
                   </span>
                 </div>
                 <h3 className="text-text-primary dark:text-white text-lg font-bold mb-2">
@@ -577,9 +671,21 @@ export default function DashboardPage() {
             {/* Quick Actions */}
             <Card>
               <h3 className="text-text-primary dark:text-white font-bold mb-4">
-                Quick Actions
+                {t.dashboard.quickActions}
               </h3>
               <div className="space-y-3">
+                <Link href="/analytics" className="block">
+                  <button className="w-full flex items-center gap-3 p-3 rounded-xl bg-background-light dark:bg-background-dark hover:bg-primary/5 dark:hover:bg-primary/10 transition-colors">
+                    <div className="p-2 bg-primary/10 rounded-lg">
+                      <span className="material-symbols-outlined text-primary">
+                        analytics
+                      </span>
+                    </div>
+                    <span className="text-sm font-medium">
+                      {t.dashboard.viewAnalytics}
+                    </span>
+                  </button>
+                </Link>
                 <Link href="/chat" className="block">
                   <button className="w-full flex items-center gap-3 p-3 rounded-xl bg-background-light dark:bg-background-dark hover:bg-primary/5 dark:hover:bg-primary/10 transition-colors">
                     <div className="p-2 bg-primary/10 rounded-lg">
@@ -587,7 +693,9 @@ export default function DashboardPage() {
                         chat
                       </span>
                     </div>
-                    <span className="text-sm font-medium">Talk to Sister</span>
+                    <span className="text-sm font-medium">
+                      {t.dashboard.talkToSister}
+                    </span>
                   </button>
                 </Link>
                 <Link href="/library" className="block">
@@ -597,7 +705,9 @@ export default function DashboardPage() {
                         menu_book
                       </span>
                     </div>
-                    <span className="text-sm font-medium">Health Library</span>
+                    <span className="text-sm font-medium">
+                      {t.dashboard.healthLibrary}
+                    </span>
                   </button>
                 </Link>
                 <Link href="/profile" className="block">
@@ -608,7 +718,7 @@ export default function DashboardPage() {
                       </span>
                     </div>
                     <span className="text-sm font-medium">
-                      Update Cycle Data
+                      {t.dashboard.updateCycleData}
                     </span>
                   </button>
                 </Link>
@@ -620,16 +730,15 @@ export default function DashboardPage() {
               <div className="flex items-center gap-2 mb-3">
                 <span className="material-symbols-outlined">support_agent</span>
                 <span className="font-bold uppercase text-xs tracking-widest">
-                  Need Support?
+                  {t.dashboard.needSupport}
                 </span>
               </div>
               <p className="text-sm mb-4 opacity-90">
-                Our AI support is available 24/7 to answer your questions about
-                menstrual health, emotional well-being, and more.
+                {t.dashboard.supportMessage}
               </p>
               <Link href="/chat">
                 <button className="w-full bg-white text-primary py-2 rounded-lg font-bold text-sm hover:bg-white/90 transition-colors">
-                  Start Chatting
+                  {t.dashboard.startChatting}
                 </button>
               </Link>
             </div>

@@ -1,14 +1,25 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import { Manrope } from "next/font/google";
 import "./globals.css";
 import { ThemeProvider } from "@/context/ThemeContext";
 import { AuthProvider } from "@/context/AuthContext";
+import { LanguageProvider } from "@/context/LanguageContext";
 import BottomNav from "@/components/layout/BottomNav";
+import OfflineIndicator from "@/components/ui/OfflineIndicator";
 
 const manrope = Manrope({
   subsets: ["latin"],
   variable: "--font-manrope",
 });
+
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  maximumScale: 1,
+  userScalable: false,
+  viewportFit: "cover",
+  themeColor: "#f7f6f8",
+};
 
 export const metadata: Metadata = {
   title: "SisterCare - Women's Well-Being & Menstrual Health",
@@ -21,6 +32,25 @@ export const metadata: Metadata = {
     "emotional support",
     "wellness",
   ],
+  manifest: "/manifest.json",
+  appleWebApp: {
+    capable: true,
+    statusBarStyle: "default",
+    title: "SisterCare",
+  },
+  formatDetection: {
+    telephone: false,
+  },
+  icons: {
+    icon: [
+      { url: "/icons/icon-192x192.png", sizes: "192x192", type: "image/png" },
+      { url: "/icons/icon-512x512.png", sizes: "512x512", type: "image/png" },
+    ],
+    apple: [
+      { url: "/icons/icon-152x152.png", sizes: "152x152", type: "image/png" },
+      { url: "/icons/icon-192x192.png", sizes: "192x192", type: "image/png" },
+    ],
+  },
 };
 
 export default function RootLayout({
@@ -29,20 +59,73 @@ export default function RootLayout({
   children: React.ReactNode;
 }) {
   return (
-    <html lang="en" suppressHydrationWarning>
+    <html lang="en" suppressHydrationWarning className="">
       <head>
         <link
           href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap"
           rel="stylesheet"
         />
+        <meta name="apple-mobile-web-app-capable" content="yes" />
+        <meta name="mobile-web-app-capable" content="yes" />
+        <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+        <script
+          dangerouslySetInnerHTML={{
+            __html: `
+              (function() {
+                try {
+                  var theme = localStorage.getItem('sistercare-theme');
+                  var isDark = false;
+                  if (theme === 'dark') {
+                    isDark = true;
+                  } else if (theme === 'system' || !theme) {
+                    isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+                  }
+                  if (isDark) {
+                    document.documentElement.classList.add('dark');
+                  } else {
+                    document.documentElement.classList.remove('dark');
+                  }
+                } catch (e) {}
+              })();
+              
+              // Register Service Worker for PWA
+              if ('serviceWorker' in navigator) {
+                window.addEventListener('load', function() {
+                  navigator.serviceWorker.register('/sw.js')
+                    .then(function(registration) {
+                      console.log('[PWA] Service Worker registered:', registration.scope);
+                    })
+                    .catch(function(error) {
+                      console.log('[PWA] Service Worker registration failed:', error);
+                    });
+                });
+              }
+            `,
+          }}
+        />
       </head>
       <body
-        className={`${manrope.variable} font-display bg-background-light dark:bg-background-dark text-text-primary dark:text-white min-h-screen`}
+        className={`${manrope.variable} font-display bg-background-light dark:bg-background-dark text-text-primary dark:text-white min-h-screen antialiased`}
       >
+        {/* Live region for screen reader announcements */}
+        <div
+          id="aria-live-region"
+          className="live-region"
+          aria-live="polite"
+          aria-atomic="true"
+        />
+
         <ThemeProvider>
           <AuthProvider>
-            {children}
-            <BottomNav />
+            <LanguageProvider>
+              <OfflineIndicator />
+              <div className="flex flex-col min-h-screen">
+                <main id="main-content" tabIndex={-1}>
+                  {children}
+                </main>
+              </div>
+              <BottomNav />
+            </LanguageProvider>
           </AuthProvider>
         </ThemeProvider>
       </body>
